@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Packet Anomaly Guard - FastAPI Backend Engine
+Documentation=https://github.com/
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/ai_pkt/backend
+ExecStart=/opt/ai_pkt/venv/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=10
+LimitNOFILE=65536
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment
+venv/
+.venv/
+env/
+.env
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# PCAP & Trained Data Exclusions (Requested by User)
+DATA.*/
+DATA.TRAIN/
+PCAP/
+*.pcap
+*.pkl
