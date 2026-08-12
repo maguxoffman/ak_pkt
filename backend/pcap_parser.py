@@ -1,6 +1,7 @@
 import os
 import time
 import struct
+import random
 import numpy as np
 from typing import List, Dict, Tuple
 from scapy.all import rdpcap, IP, IPv6, TCP, UDP, ICMP, Raw
@@ -55,6 +56,8 @@ def get_pcap_info(filepath: str) -> Dict:
         "total_packets": total_packets,
         "link_type": link_type
     }
+
+preview_pcap_info = get_pcap_info
 
 def parse_pcap_range(filepath: str, start_idx: int = 1, end_idx: int = 2500) -> Tuple[List[Dict], int]:
     """
@@ -222,3 +225,79 @@ def parse_pcap_range(filepath: str, start_idx: int = 1, end_idx: int = 2500) -> 
     print(f"[PCAP Range Parser] Parsed {len(parsed_packets)} packets with DPI Protocols in {elapsed:.3f}s")
 
     return parsed_packets, total_packets_in_file
+
+def generate_benign_packet(pkt_id: int) -> Dict:
+    length = random.choice([64, 128, 512, 1024, 1460, 1500])
+    src_ip = f"192.168.1.{random.randint(2, 200)}"
+    dst_ip = "10.0.0.1"
+    src_port = random.randint(1024, 65535)
+    dst_port = random.choice([80, 443, 22, 53, 3306])
+    proto_map = {80: "HTTP", 443: "HTTPS", 22: "SSH", 53: "DNS", 3306: "DATABASE"}
+    protocol = proto_map.get(dst_port, "TCP")
+    now_t = time.time()
+    time_str = time.strftime('%H:%M:%S', time.localtime(now_t)) + f".{int((now_t % 1) * 1000):03d}"
+
+    return {
+        "id": pkt_id,
+        "timestamp": now_t,
+        "time_str": time_str,
+        "length": length,
+        "payload_len": max(0, length - 54),
+        "src_ip": src_ip,
+        "src_port": src_port,
+        "dst_ip": dst_ip,
+        "dst_port": dst_port,
+        "protocol": protocol,
+        "tcp_flags": "ACK, PSH",
+        "tcp_flags_val": 24,
+        "tcp_syn_flag": 0.0,
+        "packet_rate_pps": random.randint(10, 80),
+        "byte_rate_bps": random.randint(10000, 150000),
+        "delta_time_ms": round(random.uniform(5.0, 50.0), 2),
+        "pps_variance": round(random.uniform(1.0, 15.0), 2),
+        "rtt_ms": round(random.uniform(1.0, 15.0), 2),
+        "header_tree": [
+            {"layer": "Frame", "info": f"{length} bytes on wire"},
+            {"layer": "Ethernet II", "info": f"Src: 00:11:22:33:44:55, Dst: 66:77:88:99:aa:bb"},
+            {"layer": "Internet Protocol Version 4", "info": f"Src: {src_ip}, Dst: {dst_ip}"},
+            {"layer": f"Transport Protocol ({protocol})", "info": f"Src Port: {src_port}, Dst Port: {dst_port}"}
+        ],
+        "hex_payload": f"10-Feature Vector Metric: Length={length}B, PPS=50, Delta=10ms"
+    }
+
+def generate_anomaly_packet(pkt_id: int) -> Dict:
+    length = random.choice([40, 8000, 15140])
+    src_ip = "192.168.56.54"
+    dst_ip = "52.147.198.201"
+    src_port = random.randint(1024, 65535)
+    dst_port = 443
+    now_t = time.time()
+    time_str = time.strftime('%H:%M:%S', time.localtime(now_t)) + f".{int((now_t % 1) * 1000):03d}"
+
+    return {
+        "id": pkt_id,
+        "timestamp": now_t,
+        "time_str": time_str,
+        "length": length,
+        "payload_len": length,
+        "src_ip": src_ip,
+        "src_port": src_port,
+        "dst_ip": dst_ip,
+        "dst_port": dst_port,
+        "protocol": "HTTPS",
+        "tcp_flags": "SYN",
+        "tcp_flags_val": 2,
+        "tcp_syn_flag": 1.0,
+        "packet_rate_pps": random.randint(500, 2500),
+        "byte_rate_bps": random.randint(2000000, 10000000),
+        "delta_time_ms": round(random.uniform(0.01, 0.4), 2),
+        "pps_variance": round(random.uniform(80.0, 300.0), 2),
+        "rtt_ms": round(random.uniform(150.0, 500.0), 2),
+        "is_simulated_attack": True,
+        "header_tree": [
+            {"layer": "Frame", "info": f"{length} bytes on wire (Outlier)"},
+            {"layer": "Internet Protocol Version 4", "info": f"Src: {src_ip}, Dst: {dst_ip}"},
+            {"layer": "Transport Protocol (HTTPS)", "info": f"Src Port: {src_port}, Dst Port: 443, Flags: SYN"}
+        ],
+        "hex_payload": f"Simulated Anomaly Attack: Length={length}B, High PPS/RTT"
+    }
