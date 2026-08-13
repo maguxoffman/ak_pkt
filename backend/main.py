@@ -93,12 +93,14 @@ def get_model_details(model_filename: str):
 @app.get("/api/sessions")
 def get_sessions():
     """Returns extracted 5-Tuple Network Sessions and summary statistics."""
+    sessions = stream_manager.get_formatted_sessions()
+    anomaly_cnt = len([s for s in sessions if s.get("is_anomaly_01")])
     return {
         "status": "ok",
-        "total_sessions": len(stream_manager.sessions_history),
-        "session_anomalies_count": stream_manager.session_anomalies_count,
+        "total_sessions": len(sessions),
+        "session_anomalies_count": anomaly_cnt,
         "score_threshold": stream_manager.session_detector.score_threshold,
-        "sessions": stream_manager.sessions_history
+        "sessions": sessions
     }
 
 @app.get("/api/pcap-files")

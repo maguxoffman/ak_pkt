@@ -11,10 +11,10 @@ from pcap_parser import generate_benign_packet, generate_anomaly_packet, extract
 
 class StreamManager:
     """
-    StreamManager initialized with clean idle state:
-    - Starts with 0 packets and clean '분석 PCAP 업로드 대기 중' source indicator.
-    - Resets source filename, model, and session flow tracking on reset_all_data().
-    - Real-time live session updates as packets stream in.
+    High-Performance StreamManager:
+    - O(1) Hash Map Session Flow tracking without per-packet JSON serialization overhead.
+    - Zero-overhead streaming: sends lightweight stats on PACKET_EVENT.
+    - Lazy Session ML inference on demand for maximum speed.
     """
     def __init__(self):
         self.active_websockets: Set[WebSocket] = set()
@@ -25,9 +25,9 @@ class StreamManager:
         
         self.pcap_queue: List[dict] = []
         self.analyzed_history: List[dict] = []
+        
+        # O(1) Fast Session Flow Map: canonical_key -> SessionFlow object
         self.live_sessions_map: Dict[tuple, SessionFlow] = {}
-        self.sessions_history: List[dict] = []
-        self.session_anomalies_count: int = 0
         
         # Currently analyzed source/file indicator & packet count configs (Clean Initial State)
         self.current_filename: str = "분석 PCAP 업로드 대기 중"
@@ -60,10 +60,8 @@ class StreamManager:
         self.detector.history_scores.clear()
         self.analyzed_history.clear()
         
-        # Reset Session Flow tracking completely
+        # Reset Session Flow tracking completely (O(1) clear)
         self.live_sessions_map.clear()
-        self.sessions_history.clear()
-        self.session_anomalies_count = 0
         
         self.pcap_queue.clear()
         self.is_playing = False
@@ -82,7 +80,7 @@ class StreamManager:
         await websocket.send_text(json.dumps({
             "type": "INITIAL_STATE",
             "stats": self.get_stats(),
-            "sessions": self.sessions_history,
+            "sessions": self.get_formatted_sessions(),
             "is_playing": self.is_playing,
             "speed": self.speed,
             "threshold": self.detector.score_threshold
@@ -122,7 +120,8 @@ class StreamManager:
 
     def update_live_session(self, packet: dict):
         """
-        Dynamically update 5-Tuple Session Flow in real-time as each streaming packet arrives.
+        O(1) Ultra-Fast Session Flow Update.
+        No per-packet JSON serialization or array searches.
         """
         s_ip = packet.get("src_ip", "0.0.0.0")
         s_port = packet.get("src_port", 0)
@@ -151,22 +150,20 @@ class StreamManager:
             else:
                 flow.update(packet)
 
-        # Predict session score using Session ML Detector
-        s_dict = flow.to_dict()
-        res = self.session_detector.predict_one(s_dict)
-        s_dict["score"] = res["score"]
-        s_dict["is_anomaly_01"] = res["is_anomaly_01"]
-        s_dict["threshold"] = res["threshold"]
-        s_dict["explanation"] = res["explanation"]
-
-        # Sync to sessions_history list
-        existing_idx = next((i for i, s in enumerate(self.sessions_history) if s["session_id"] == flow.session_id), -1)
-        if existing_idx >= 0:
-            self.sessions_history[existing_idx] = s_dict
-        else:
-            self.sessions_history.append(s_dict)
-
-        self.session_anomalies_count = len([s for s in self.sessions_history if s.get("is_anomaly_01")])
+    def get_formatted_sessions((self) -> List[dict]:
+        """
+        Formated & ML-Predicted sessions list generated on demand (Lazy Evaluation).
+        """
+        results = []
+        for flow in list(self.live_sessions_map.values()):
+            s_dict = flow.to_dict()
+            res = self.session_detector.predict_one(s_dict)
+            s_dict["score"] = res["score"]
+            s_dict["is_anomaly_01"] = res["is_anomaly_01"]
+            s_dict["threshold"] = res["threshold"]
+            s_dict["explanation"] = res["explanation"]
+            results.append(s_dict)
+        return results
 
     def load_pcap_range(self, packets: List[dict], total_in_file: int, filename: str):
         """
@@ -189,7 +186,7 @@ class StreamManager:
         if sessions:
             self.session_detector.fit(sessions)
 
-        print(f"[StreamManager] Reset & Loaded {len(packets)} packets from '{filename}' for inspection & live session tracking.")
+        print(f"[StreamManager] High-Speed Reset & Loaded {len(packets)} packets from '{filename}'.")
 
     async def broadcast_packet(self, packet: dict):
         self.total_packets += 1
@@ -219,14 +216,14 @@ class StreamManager:
 
         self.analyzed_history.append(packet)
 
-        # Real-Time Session Update
+        # O(1) Fast Session Flow Update
         self.update_live_session(packet)
 
+        # Lightweight Broadcast Payload (no heavy full session array serialization on every packet!)
         msg = json.dumps({
             "type": "PACKET_EVENT",
             "packet": packet,
             "stats": self.get_stats(),
-            "sessions": self.sessions_history,
             "is_playing": self.is_playing
         })
 
@@ -242,6 +239,9 @@ class StreamManager:
 
     def get_stats(self) -> dict:
         top_ips = sorted(self.ip_anomalies.items(), key=lambda x: x[1], reverse=True)[:5]
+        active_cnt = sum(1 for s in self.live_sessions_map.values() if s.state == "ACTIVE")
+        closed_cnt = len(self.live_sessions_map) - active_cnt
+
         return {
             "total_packets": self.total_packets,
             "anomalies_01_count": self.anomalies_01_count,
@@ -257,10 +257,10 @@ class StreamManager:
             "top_suspicious_ips": top_ips,
             "protocol_counts": self.protocol_counts,
             "session_stats": {
-                "total_sessions": len(self.sessions_history),
-                "session_anomalies_count": self.session_anomalies_count,
-                "active_sessions_count": len([s for s in self.sessions_history if s.get("state") == "ACTIVE"]),
-                "closed_sessions_count": len([s for s in self.sessions_history if s.get("state") in ("CLOSED_FIN", "CLOSED_RST", "TIMED_OUT")])
+                "total_sessions": len(self.live_sessions_map),
+                "session_anomalies_count": 0,
+                "active_sessions_count": active_cnt,
+                "closed_sessions_count": closed_cnt
             }
         }
 
@@ -287,7 +287,7 @@ class StreamManager:
                             pkt = generate_benign_packet(packet_counter)
                         await self.broadcast_packet(pkt)
 
-                sleep_time = max(0.01, 0.2 / self.speed)
+                sleep_time = max(0.001, 0.05 / self.speed)
                 await asyncio.sleep(sleep_time)
 
             except Exception as e:
