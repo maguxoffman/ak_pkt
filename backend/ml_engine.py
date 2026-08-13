@@ -441,3 +441,102 @@ class PacketAnomalyDetector:
             return f"🎯 10D Joint Feature Outlier (Score: {score:.4f} > Cutoff: {self.score_threshold:.4f})"
 
         return "Normal Traffic (10-Feature Vector)"
+
+
+class SessionAnomalyDetector:
+    """
+    Isolation Forest Detector for 5-Tuple Network Sessions (Flows).
+    - Session 10-Feature Vector:
+      [duration_sec, packet_count, total_bytes, asymmetry_ratio, avg_rtt_ms, max_rtt_ms, pps_avg, bps_avg, syn_count, is_abnormal_close]
+    """
+    def __init__(self, contamination: float = 0.001):
+        self.contamination = contamination
+        self.scaler = StandardScaler()
+        self.model = IsolationForest(
+            n_estimators=100,
+            contamination=self.contamination,
+            random_state=42,
+            n_jobs=-1
+        )
+        self.is_fitted = False
+        self.score_threshold = 0.70
+
+    def extract_features(self, session: dict) -> list:
+        duration_sec = float(session.get("duration_sec", 0.01))
+        packet_count = float(session.get("packet_count", 1))
+        total_bytes = float(session.get("total_bytes", 64))
+        asymmetry_ratio = float(session.get("asymmetry_ratio", 1.0))
+        avg_rtt_ms = float(session.get("avg_rtt_ms", 0.0))
+        max_rtt_ms = float(session.get("max_rtt_ms", 0.0))
+        pps_avg = float(session.get("pps_avg", 1.0))
+        bps_avg = float(session.get("bps_avg", 0.0))
+        syn_count = float(session.get("syn_count", 0))
+        is_abnormal_close = 1.0 if (session.get("rst_count", 0) > 0 or session.get("state") == "CLOSED_RST") else 0.0
+
+        return [duration_sec, packet_count, total_bytes, asymmetry_ratio, avg_rtt_ms, max_rtt_ms, pps_avg, bps_avg, syn_count, is_abnormal_close]
+
+    def fit(self, sessions: list):
+        if not sessions:
+            return
+
+        X = np.array([self.extract_features(s) for s in sessions])
+        X_scaled = self.scaler.fit_transform(X)
+        self.model.fit(X_scaled)
+        self.is_fitted = True
+
+        raw_scores = -self.model.score_samples(X_scaled)
+        self.score_threshold = float(np.percentile(raw_scores, 99.9))
+        print(f"[Session ML Engine Fit] Trained on {len(sessions)} sessions. 99.9% Session Cutoff: {self.score_threshold:.4f}")
+
+    def predict_one(self, session: dict) -> dict:
+        if not self.is_fitted:
+            total_bytes = session.get("total_bytes", 0)
+            avg_rtt = session.get("avg_rtt_ms", 0.0)
+            score = 0.76 if (total_bytes > 5000000 or avg_rtt > 80.0 or session.get("rst_count", 0) > 0) else 0.45
+            is_anomaly = score >= self.score_threshold
+            return {
+                "score": round(score, 4),
+                "is_anomaly_01": is_anomaly,
+                "threshold": round(self.score_threshold, 4),
+                "explanation": self._explain_session(session, score)
+            }
+
+        X = np.array([self.extract_features(session)])
+        X_scaled = self.scaler.transform(X)
+        raw_score = float(-self.model.score_samples(X_scaled)[0])
+        score = round(raw_score, 4)
+        is_anomaly = raw_score >= self.score_threshold
+
+        return {
+            "score": score,
+            "is_anomaly_01": is_anomaly,
+            "threshold": round(self.score_threshold, 4),
+            "explanation": self._explain_session(session, score)
+        }
+
+    def _explain_session(self, session: dict, score: float) -> str:
+        reasons = []
+        tot_bytes = session.get("total_bytes", 0)
+        avg_rtt = session.get("avg_rtt_ms", 0.0)
+        pps_avg = session.get("pps_avg", 0.0)
+        asym = session.get("asymmetry_ratio", 1.0)
+        rst_cnt = session.get("rst_count", 0)
+
+        if tot_bytes > 5000000:
+            reasons.append(f"🌊 Massive Data Exfiltration Flow ({tot_bytes / 1024 / 1024:.2f} MB)")
+        if avg_rtt > 80.0:
+            reasons.append(f"⌛ High Session Latency (Avg RTT: {avg_rtt:.1f} ms)")
+        if pps_avg > 200.0:
+            reasons.append(f"⚡ High Speed Session Burst (Avg {pps_avg:.1f} pps)")
+        if asym > 15.0:
+            reasons.append(f"📈 High Upload Asymmetry Ratio (Tx/Rx: {asym:.1f})")
+        if rst_cnt > 0 or session.get("state") == "CLOSED_RST":
+            reasons.append("💥 Abnormal Session Reset / Connection Failure")
+
+        if reasons:
+            return " | ".join(reasons)
+
+        if score >= self.score_threshold:
+            return f"🎯 10D Session Joint Vector Outlier (Score: {score:.4f} > Cutoff: {self.score_threshold:.4f})"
+
+        return "Normal Session Flow"

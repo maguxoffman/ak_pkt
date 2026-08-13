@@ -6,8 +6,8 @@ import os
 import numpy as np
 from typing import List, Set
 from fastapi import WebSocket
-from ml_engine import PacketAnomalyDetector
-from pcap_parser import generate_benign_packet, generate_anomaly_packet
+from ml_engine import PacketAnomalyDetector, SessionAnomalyDetector
+from pcap_parser import generate_benign_packet, generate_anomaly_packet, extract_sessions_from_packets
 from server_analyzer import generate_server_analysis_report
 
 class StreamManager:
@@ -22,9 +22,12 @@ class StreamManager:
         self.is_playing: bool = False
         self.speed: float = 1.0
         self.detector = PacketAnomalyDetector(contamination=0.001)
+        self.session_detector = SessionAnomalyDetector(contamination=0.001)
         
         self.pcap_queue: List[dict] = []
         self.analyzed_history: List[dict] = []
+        self.sessions_history: List[dict] = []
+        self.session_anomalies_count: int = 0
         
         # Currently analyzed source/file indicator & packet count configs (Clean Initial State)
         self.current_filename: str = "분석 PCAP 업로드 대기 중"
@@ -48,7 +51,7 @@ class StreamManager:
         self.protocol_counts = {"TCP": 0, "UDP": 0, "HTTPS": 0, "DNS": 0, "OTHER": 0}
 
     def reset_all_data(self):
-        """Clear all packet statistics, history, currently inspecting source filename, and model name."""
+        """Clear all packet & session statistics, history, currently inspecting source filename, and model name."""
         self.total_packets = 0
         self.anomalies_01_count = 0
         self.max_score = 0.0
@@ -56,6 +59,8 @@ class StreamManager:
         self.protocol_counts = {"TCP": 0, "UDP": 0, "HTTPS": 0, "DNS": 0, "OTHER": 0}
         self.detector.history_scores.clear()
         self.analyzed_history.clear()
+        self.sessions_history.clear()
+        self.session_anomalies_count = 0
         self.pcap_queue.clear()
         self.is_playing = False
         self.is_pcap_session = False
@@ -65,7 +70,7 @@ class StreamManager:
         self.saved_model_filename = "선택 안됨"
         self.analysis_target_count = 0
         self.total_packets_in_file = 0
-        print("[StreamManager] All statistics, inspecting source filename, and model name cleanly reset.")
+        print("[StreamManager] All statistics, session history, and inspecting source filename cleanly reset.")
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -98,60 +103,98 @@ class StreamManager:
         """Recalibrate 99.9th percentile threshold on active session packets to guarantee 0.1% cutoff."""
         if not packets or not self.detector.is_fitted:
             return
-        
-        try:
-            X = np.array([self.detector.extract_features(p) for p in packets])
+
+        scores = []
+        for p in packets:
+            X = np.array([self.detector.extract_features(p)])
             X_scaled = self.detector.scaler.transform(X)
-            raw_scores = -self.detector.model.score_samples(X_scaled)
-            calibrated_threshold = float(np.percentile(raw_scores, 99.9))
-            
-            self.detector.score_threshold = max(self.detector.score_threshold, calibrated_threshold)
-            print(f"[StreamManager] Calibrated 99.9% session threshold: {self.detector.score_threshold:.4f}")
-        except Exception as e:
-            print(f"[StreamManager Calibration Error] {e}")
+            score = float(-self.detector.model.score_samples(X_scaled)[0])
+            scores.append(score)
 
-    def learn_feedback_ip(self, ip: str):
-        """Register IP as approved server & retrain ML model."""
-        self.detector.add_approved_encrypted_ip(ip)
-        if hasattr(self, 'saved_warmup_packets') and self.saved_warmup_packets:
-            self.detector.fit(self.saved_warmup_packets)
-            if self.saved_model_filename and self.saved_model_filename != "선택 안됨":
-                self.detector.save_trained_model(self.saved_model_filename)
+        new_thresh = float(np.percentile(scores, 99.9))
+        self.detector.score_threshold = round(new_thresh, 4)
+        print(f"[StreamManager Calibrate] Dynamic 99.9% threshold set to: {self.detector.score_threshold:.4f} across {len(packets)} packets.")
 
-        new_anomalies = 0
-        for pkt in self.analyzed_history:
-            res = self.detector.predict_one(pkt)
-            pkt.update(res)
-            if pkt.get("is_anomaly_01"):
-                new_anomalies += 1
+    def load_pcap_range(self, packets: List[dict], total_in_file: int, filename: str):
+        """
+        Load packets from PCAP file for inspection and extract 5-Tuple Network Sessions.
+        """
+        self.reset_all_data()
 
-        self.anomalies_01_count = new_anomalies
-        print(f"[StreamManager] Active learning feedback applied for IP '{ip}'. Re-evaluated anomalies: {new_anomalies}")
+        self.saved_inspection_packets = list(packets)
+        self.pcap_queue = list(packets)
+        self.total_packets_in_file = total_in_file
+        self.current_filename = filename
+        self.analysis_target_count = len(packets)
+        self.is_pcap_session = True
 
-    def inject_attack(self, attack_type: str = None) -> dict:
-        """Forcefully inject an anomalous attack packet."""
-        pkt = generate_anomaly_packet(attack_type)
-        res = self.detector.predict_one(pkt)
-        pkt.update(res)
-        self._update_stats(pkt)
-        return pkt
+        if self.detector.is_fitted and packets:
+            self.calibrate_session_threshold(packets)
 
-    def _update_stats(self, pkt: dict):
+        # Extract & Analyze 5-Tuple Network Sessions
+        sessions = extract_sessions_from_packets(packets)
+        if sessions:
+            self.session_detector.fit(sessions)
+            for s in sessions:
+                res = self.session_detector.predict_one(s)
+                s["score"] = res["score"]
+                s["is_anomaly_01"] = res["is_anomaly_01"]
+                s["threshold"] = res["threshold"]
+                s["explanation"] = res["explanation"]
+
+            self.sessions_history = sessions
+            self.session_anomalies_count = len([s for s in sessions if s.get("is_anomaly_01")])
+            print(f"[StreamManager Sessions] Extracted & Analyzed {len(sessions)} sessions ({self.session_anomalies_count} session anomalies)")
+
+        print(f"[StreamManager] Loaded {len(packets)} packets from '{filename}' for inspection. Model: {self.saved_model_filename}")
+
+    async def broadcast_packet(self, packet: dict):
         self.total_packets += 1
-        self.analyzed_history.append(pkt)
+        proto = packet.get("protocol", "OTHER")
+        if proto in self.protocol_counts:
+            self.protocol_counts[proto] += 1
+        else:
+            self.protocol_counts["OTHER"] += 1
 
-        proto = pkt.get("protocol", "OTHER")
-        self.protocol_counts[proto] = self.protocol_counts.get(proto, 0) + 1
+        result = self.detector.predict_one(packet)
+        score = result["score"]
+        is_anomaly_01 = result["is_anomaly_01"]
 
-        if pkt.get("score", 0.0) > self.max_score:
-            self.max_score = pkt.get("score", 0.0)
+        packet["score"] = score
+        packet["is_anomaly_01"] = is_anomaly_01
+        packet["threshold"] = result["threshold"]
+        packet["explanation"] = result["explanation"]
+        packet["metric_comparison"] = result.get("metric_comparison", [])
 
-        if pkt.get("is_anomaly_01"):
+        if score > self.max_score:
+            self.max_score = score
+
+        if is_anomaly_01:
             self.anomalies_01_count += 1
-            src_ip = pkt.get("src_ip", "Unknown")
+            src_ip = packet.get("src_ip", "unknown")
             self.ip_anomalies[src_ip] = self.ip_anomalies.get(src_ip, 0) + 1
 
+        self.analyzed_history.append(packet)
+
+        msg = json.dumps({
+            "type": "PACKET_EVENT",
+            "packet": packet,
+            "stats": self.get_stats(),
+            "is_playing": self.is_playing
+        })
+
+        disconnected = set()
+        for ws in self.active_websockets:
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                disconnected.add(ws)
+
+        for ws in disconnected:
+            self.active_websockets.remove(ws)
+
     def get_stats(self) -> dict:
+        top_ips = sorted(self.ip_anomalies.items(), key=lambda x: x[1], reverse=True)[:5]
         return {
             "total_packets": self.total_packets,
             "anomalies_01_count": self.anomalies_01_count,
@@ -162,56 +205,46 @@ class StreamManager:
             "max_packets_config": self.max_packets_config,
             "warmup_count": self.warmup_count,
             "analysis_target_count": self.analysis_target_count,
-            "pcap_queue_left": len(self.pcap_queue),
-            "is_pcap_session": self.is_pcap_session,
             "saved_model_filename": self.saved_model_filename,
-            "last_trained_filename": self.last_trained_filename,
             "approved_encrypted_ips": list(self.detector.approved_encrypted_ips),
-            "top_suspicious_ips": sorted(self.ip_anomalies.items(), key=lambda x: x[1], reverse=True)[:5],
-            "protocol_counts": self.protocol_counts
+            "top_suspicious_ips": top_ips,
+            "protocol_counts": self.protocol_counts,
+            "session_stats": {
+                "total_sessions": len(self.sessions_history),
+                "session_anomalies_count": self.session_anomalies_count,
+                "active_sessions_count": len([s for s in self.sessions_history if s.get("state") == "ACTIVE"]),
+                "closed_sessions_count": len([s for s in self.sessions_history if s.get("state") in ("CLOSED_FIN", "CLOSED_RST", "TIMED_OUT")])
+            }
         }
 
-    def get_server_report(self) -> dict:
-        """Generate server profile report from analyzed packet history."""
-        return generate_server_analysis_report(self.analyzed_history, self.total_packets_in_file, self.analysis_target_count, self.warmup_count)
-
-    async def broadcast_packet(self, pkt: dict):
-        if not self.active_websockets:
-            return
-        payload = json.dumps({
-            "type": "PACKET_EVENT",
-            "packet": pkt,
-            "stats": self.get_stats(),
-            "is_playing": self.is_playing
-        })
-        disconnected = set()
-        for ws in self.active_websockets:
-            try:
-                await ws.send_text(payload)
-            except Exception:
-                disconnected.add(ws)
-        for ws in disconnected:
-            self.active_websockets.remove(ws)
-
-    async def stream_loop(self):
-        """Background continuous stream producer loop."""
+    async def start_streaming_loop(self):
+        packet_counter = 0
         while True:
-            if self.is_playing and self.is_pcap_session:
-                if self.total_packets >= self.analysis_target_count or not self.pcap_queue:
-                    print(f"[StreamManager] Inspection Stream Completed ({self.total_packets}/{self.analysis_target_count}). Stopping stream.")
-                    self.is_playing = False
-                    await self.broadcast_packet({})
-                    await asyncio.sleep(0.1)
-                    continue
+            try:
+                if self.is_playing:
+                    if self.is_pcap_session:
+                        if self.pcap_queue:
+                            pkt = self.pcap_queue.pop(0)
+                            await self.broadcast_packet(pkt)
+                            
+                            if self.total_packets >= self.analysis_target_count:
+                                self.is_playing = False
+                                print(f"[StreamManager] Reached end of PCAP inspection range ({self.analysis_target_count} packets). Paused.")
+                        else:
+                            self.is_playing = False
+                    else:
+                        packet_counter += 1
+                        if random.random() < 0.001:
+                            pkt = generate_anomaly_packet(packet_counter)
+                        else:
+                            pkt = generate_benign_packet(packet_counter)
+                        await self.broadcast_packet(pkt)
 
-                pkt = self.pcap_queue.pop(0)
-                result = self.detector.predict_one(pkt)
-                pkt.update(result)
-                self._update_stats(pkt)
+                sleep_time = max(0.01, 0.2 / self.speed)
+                await asyncio.sleep(sleep_time)
 
-                await self.broadcast_packet(pkt)
-
-            sleep_time = max(0.01, 0.1 / self.speed)
-            await asyncio.sleep(sleep_time)
+            except Exception as e:
+                print(f"[StreamManager Loop Exception] {e}")
+                await asyncio.sleep(0.5)
 
 stream_manager = StreamManager()

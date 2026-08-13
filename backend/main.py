@@ -1,34 +1,17 @@
-import asyncio
 import os
-import tempfile
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Form
+import asyncio
+from typing import Optional, List
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
 
 from stream_manager import stream_manager
-from pcap_parser import parse_pcap_range, preview_pcap_info
-from ml_engine import PacketAnomalyDetector
-
-# Dynamic PCAP Storage Directory Path
-PCAP_DIR = os.environ.get("PCAP_DIR", "")
-if not PCAP_DIR:
-    candidates = [
-        "/var/ai_pkt/PCAP",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "PCAP"),
-        "/PCAP"
-    ]
-    for cand in candidates:
-        if os.path.exists(cand):
-            PCAP_DIR = os.path.abspath(cand)
-            break
-    if not PCAP_DIR:
-        PCAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "PCAP")
-        os.makedirs(PCAP_DIR, exist_ok=True)
+from pcap_parser import parse_pcap_range, preview_pcap_info, extract_sessions_from_packets
+from server_analyzer import generate_server_analysis_report
 
 app = FastAPI(
-    title="AI Network Packet Anomaly Guard",
-    version="2.4.0"
+    title="AI Packet Anomaly Guard API (10-Feature Vector with RTT & 5-Tuple Session Flow)",
+    version="2.8"
 )
 
 app.add_middleware(
@@ -39,19 +22,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+PCAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "PCAP")
+
+class ControlRequest(BaseModel):
+    action: str
+    speed: Optional[float] = 1.0
+
 class StreamControlRequest(BaseModel):
     action: str
     speed: Optional[float] = 1.0
 
-class InjectAttackRequest(BaseModel):
-    attack_type: Optional[str] = None
+class FeedbackLearnRequest(BaseModel):
+    ip: str
+    label: str = "approved_server"
 
 class PcapInfoRequest(BaseModel):
     pcap_filename: str
 
 class TrainModelRequest(BaseModel):
     pcap_filename: str
-    custom_model_name: Optional[str] = "learning_model_1"
+    custom_model_name: Optional[str] = None
     from_pkt: Optional[int] = 1
     to_pkt: Optional[int] = 1000
 
@@ -61,24 +51,24 @@ class AnalyzePcapRequest(BaseModel):
     from_pkt: Optional[int] = 1
     to_pkt: Optional[int] = 2500
 
-class FeedbackLearnRequest(BaseModel):
-    ip: str
-    label: Optional[str] = "approved_server"
+class InjectAttackRequest(BaseModel):
+    attack_type: str = "size_anomaly"
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(stream_manager.stream_loop())
-    print(f"[FastAPI] Packet stream producer started. PCAP Storage Dir: {PCAP_DIR}")
+    asyncio.create_task(stream_manager.start_streaming_loop())
+    print("[FastAPI Startup] AI Packet Anomaly Guard (10-Feature + 5-Tuple Session Flow) Started.")
 
 @app.get("/")
-@app.head("/")
-def root_check():
-    return {"status": "ok", "service": "AI Packet Anomaly Guard"}
-
-@app.get("/health")
-@app.head("/health")
-def health_check():
-    return {"status": "ok", "service": "AI Packet Anomaly Guard"}
+def read_root():
+    return {
+        "status": "online",
+        "service": "AI Packet Anomaly Guard API (10-Feature Vector with RTT & 5-Tuple Session Flow)",
+        "version": "2.8",
+        "pcap_dir": PCAP_DIR,
+        "is_fitted": stream_manager.detector.is_fitted,
+        "score_threshold": stream_manager.detector.score_threshold
+    }
 
 @app.get("/api/stats")
 def get_stats():
@@ -86,34 +76,37 @@ def get_stats():
 
 @app.get("/api/server-report")
 def get_server_report():
-    return stream_manager.get_server_report()
+    return generate_server_analysis_report(stream_manager.analyzed_history)
 
 @app.get("/api/models")
-def get_learning_models():
-    """List all trained model .pkl files stored in /DATA.TRAIN directory."""
-    models = PacketAnomalyDetector.list_saved_models()
-    return {
-        "status": "ok",
-        "count": len(models),
-        "DATA.TRAIN_dir": "/DATA.TRAIN",
-        "models": models
-    }
+def list_trained_models():
+    models = stream_manager.detector.list_saved_models()
+    return {"status": "ok", "count": len(models), "models": models}
 
 @app.get("/api/model-details/{model_filename}")
 def get_model_details(model_filename: str):
-    """Get complete threshold calibration metrics and feature vector statistics for a specific model."""
-    details = PacketAnomalyDetector.get_model_details(model_filename)
+    details = stream_manager.detector.get_model_details(model_filename)
     if "error" in details:
         raise HTTPException(status_code=404, detail=details["error"])
     return details
 
+@app.get("/api/sessions")
+def get_sessions():
+    """Returns extracted 5-Tuple Network Sessions and summary statistics."""
+    return {
+        "status": "ok",
+        "total_sessions": len(stream_manager.sessions_history),
+        "session_anomalies_count": stream_manager.session_anomalies_count,
+        "score_threshold": stream_manager.session_detector.score_threshold,
+        "sessions": stream_manager.sessions_history
+    }
+
 @app.get("/api/pcap-files")
-def get_pcap_files():
-    """List all .pcap, .pcapng, .cap files stored in /PCAP directory."""
+def list_pcap_files():
     pcap_files = []
     if os.path.exists(PCAP_DIR):
-        for f in sorted(os.listdir(PCAP_DIR)):
-            if f.endswith((".pcap", ".pcapng", ".cap")):
+        for f in os.listdir(PCAP_DIR):
+            if f.endswith(".pcap") or f.endswith(".pcapng"):
                 full_path = os.path.join(PCAP_DIR, f)
                 size_mb = round(os.path.getsize(full_path) / (1024 * 1024), 2)
                 pcap_files.append({
@@ -130,7 +123,6 @@ def get_pcap_files():
 
 @app.post("/api/pcap-info")
 def get_pcap_file_info(req: PcapInfoRequest):
-    """Fast preview packet count for a selected file in /PCAP directory."""
     filename = req.pcap_filename.strip()
     filepath = os.path.join(PCAP_DIR, filename)
     if not os.path.exists(filepath):
@@ -143,7 +135,6 @@ def get_pcap_file_info(req: PcapInfoRequest):
 
 @app.post("/api/train-model")
 def train_model(req: TrainModelRequest):
-    """Train ML model using selected PCAP file in /PCAP directory."""
     pcap_filename = req.pcap_filename.strip()
     filepath = os.path.join(PCAP_DIR, pcap_filename)
     if not os.path.exists(filepath):
@@ -168,37 +159,29 @@ def train_model(req: TrainModelRequest):
     stream_manager.saved_model_filename = model_name
     stream_manager.saved_model_path = saved_path
     stream_manager.last_trained_filename = pcap_filename
-    stream_manager.warmup_count = len(packets)
 
     return {
-        "status": "trained_and_saved",
-        "message": f"학습 데이터가 /DATA.TRAIN/{model_name} 로 정상 저장되었습니다. (범위: {from_pkt} ~ {to_pkt}번, 총 {len(packets)}개)",
+        "status": "success",
+        "message": f"10-Feature 모델 '{model_name}'이 /DATA.TRAIN 에 성공적으로 저장되었습니다.",
         "model_filename": model_name,
-        "saved_model_path": saved_path,
-        "from_pkt": from_pkt,
-        "to_pkt": to_pkt,
+        "pcap_filename": pcap_filename,
         "train_packet_count": len(packets),
         "total_packets_in_file": total_in_file,
-        "score_threshold": stream_manager.detector.score_threshold,
-        "stats": stream_manager.get_stats()
+        "score_threshold": stream_manager.detector.score_threshold
     }
 
 @app.post("/api/analyze-pcap")
-def analyze_pcap(req: AnalyzePcapRequest):
-    """Stream packet analysis using selected PCAP file in /PCAP directory."""
-    if not req.model_filename:
-        raise HTTPException(status_code=400, detail="/DATA.TRAIN 디렉토리에서 분석에 사용할 학습 모델을 선택해 주세요.")
-
-    loaded_ok = stream_manager.detector.load_trained_model(req.model_filename)
-    if not loaded_ok:
-        raise HTTPException(status_code=404, detail=f"/DATA.TRAIN 디렉토리에서 모델 '{req.model_filename}'을 로드하지 못했습니다.")
-
-    stream_manager.saved_model_filename = req.model_filename
-
+def analyze_pcap_range(req: AnalyzePcapRequest):
     pcap_filename = req.pcap_filename.strip()
     filepath = os.path.join(PCAP_DIR, pcap_filename)
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail=f"/PCAP 디렉토리에 분석 PCAP 파일이 존재하지 않습니다: {pcap_filename}")
+
+    if req.model_filename:
+        model_name = req.model_filename.strip()
+        loaded_ok = stream_manager.detector.load_trained_model(model_name)
+        if loaded_ok:
+            stream_manager.saved_model_filename = model_name
 
     from_pkt = req.from_pkt if (req.from_pkt and req.from_pkt > 0) else 1
     to_pkt = req.to_pkt if (req.to_pkt and req.to_pkt >= from_pkt) else 2500
@@ -207,22 +190,11 @@ def analyze_pcap(req: AnalyzePcapRequest):
     if not packets:
         raise HTTPException(status_code=400, detail=f"패킷 범위 [{from_pkt} ~ {to_pkt}] 추출에 실패했습니다.")
 
-    stream_manager.calibrate_session_threshold(packets)
-
-    stream_manager.total_packets = 0
-    stream_manager.anomalies_01_count = 0
-    stream_manager.analyzed_history.clear()
-    stream_manager.saved_inspection_packets = list(packets)
-    stream_manager.pcap_queue = list(packets)
-
-    stream_manager.current_filename = f"PCAP: {pcap_filename} (범위: {from_pkt} ~ {to_pkt}번)"
-    stream_manager.total_packets_in_file = total_in_file
-    stream_manager.analysis_target_count = len(packets)
-    stream_manager.is_pcap_session = True
+    stream_manager.load_pcap_range(packets, total_in_file, pcap_filename)
 
     return {
         "status": "ready_for_analysis",
-        "message": f"모델 '{req.model_filename}'으로 파일 [{pcap_filename}] 범위 [{from_pkt} ~ {to_pkt}] 분석 준비 완료.",
+        "message": f"모델 '{req.model_filename}'으로 파일 [{pcap_filename}] 범위 [{from_pkt} ~ {to_pkt}] 및 5-Tuple 세션 분석 준비 완료.",
         "filename": pcap_filename,
         "from_pkt": from_pkt,
         "to_pkt": to_pkt,
@@ -235,7 +207,7 @@ def analyze_pcap(req: AnalyzePcapRequest):
 
 @app.post("/api/feedback-learn")
 def feedback_learn(req: FeedbackLearnRequest):
-    stream_manager.learn_feedback_ip(req.ip)
+    stream_manager.detector.add_approved_encrypted_ip(req.ip)
     return {
         "status": "learned",
         "approved_ip": req.ip,
@@ -258,12 +230,6 @@ def control_stream(req: StreamControlRequest):
         "speed": stream_manager.speed,
         "stats": stream_manager.get_stats()
     }
-
-@app.post("/api/inject-attack")
-async def inject_attack(req: InjectAttackRequest):
-    pkt = stream_manager.inject_attack(req.attack_type)
-    await stream_manager.broadcast_packet(pkt)
-    return {"status": "injected", "packet": pkt}
 
 @app.websocket("/ws/packets")
 async def websocket_packets(websocket: WebSocket):

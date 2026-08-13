@@ -9,6 +9,7 @@ from scapy.all import rdpcap, IP, IPv6, TCP, UDP, ICMP, Raw
 def get_pcap_info(filepath: str) -> Dict:
     """
     C-Speed Binary Fingerprint Inspector for instant packet counting & size computation.
+    Supports both classic PCAP (0xd4c3b2a1, 0xa1b2c3d4) and PCAPNG (0x0a0d0d0a).
     """
     if not os.path.exists(filepath):
         return {"error": f"File not found: {filepath}"}
@@ -26,25 +27,54 @@ def get_pcap_info(filepath: str) -> Dict:
                 return {"error": "Invalid PCAP file header"}
 
             magic = global_header[:4]
-            if magic in (b'\xd4\xc3\xb2\xa1', b'\x0a\x0d\x0d\x0a'):
-                pass
 
-            link_type = struct.unpack('<I', global_header[20:24])[0]
+            # 1. PCAPNG Format (0x0a0d0d0a)
+            if magic == b'\x0a\x0d\x0d\x0a':
+                f.seek(0)
+                while True:
+                    hdr = f.read(8)
+                    if len(hdr) < 8:
+                        break
+                    btype, blen = struct.unpack('<II', hdr)
+                    if blen < 12:
+                        break
+                    if btype in (0x00000006, 0x00000003):  # Enhanced Packet Block or Simple Packet Block
+                        total_packets += 1
+                    f.seek(blen - 8, 1)
 
-            while True:
-                pkt_header = f.read(16)
-                if len(pkt_header) < 16:
-                    break
-                incl_len = struct.unpack('<I', pkt_header[8:12])[0]
-                total_packets += 1
-                f.seek(incl_len, 1)
+            # 2. Standard PCAP Format (Little-endian: 0xd4c3b2a1 or 0x4d3cb2a1)
+            elif magic in (b'\xd4\xc3\xb2\xa1', b'\x4d\x3c\xb2\xa1'):
+                link_type = struct.unpack('<I', global_header[20:24])[0]
+                while True:
+                    pkt_header = f.read(16)
+                    if len(pkt_header) < 16:
+                        break
+                    incl_len = struct.unpack('<I', pkt_header[8:12])[0]
+                    if incl_len == 0 or incl_len > 100000:
+                        break
+                    total_packets += 1
+                    f.seek(incl_len, 1)
+
+            # 3. Standard PCAP Format (Big-endian: 0xa1b2c3d4 or 0xa1b23c4d)
+            elif magic in (b'\xa1\xb2\xc3\xd4', b'\xa1\xb2\x3c\x4d'):
+                link_type = struct.unpack('>I', global_header[20:24])[0]
+                while True:
+                    pkt_header = f.read(16)
+                    if len(pkt_header) < 16:
+                        break
+                    incl_len = struct.unpack('>I', pkt_header[8:12])[0]
+                    if incl_len == 0 or incl_len > 100000:
+                        break
+                    total_packets += 1
+                    f.seek(incl_len, 1)
 
     except Exception as e:
         print(f"[PCAP Binary Parser Warning] Fast count fallback for {filepath}: {e}")
 
+    # Fallback to Scapy rdpcap if binary parsing counted 0 packets
     if total_packets == 0:
         try:
-            pkts = rdpcap(filepath)
+            pkts = rdpcap(filepath, count=5000)
             total_packets = len(pkts)
         except Exception:
             total_packets = 1000
@@ -58,6 +88,163 @@ def get_pcap_info(filepath: str) -> Dict:
     }
 
 preview_pcap_info = get_pcap_info
+
+class SessionFlow:
+    """
+    Represents a 5-Tuple Network Session (Flow): (src_ip, src_port, dst_ip, dst_port, protocol)
+    """
+    def __init__(self, session_id: int, key: tuple, first_packet: dict):
+        self.session_id = session_id
+        self.key = key  # (src_ip, src_port, dst_ip, dst_port, protocol)
+        self.src_ip, self.src_port, self.dst_ip, self.dst_port, self.protocol = key
+        
+        self.start_time = first_packet.get("timestamp", time.time())
+        self.last_time = self.start_time
+        self.duration_sec = 0.0
+        
+        self.packet_count = 0
+        self.total_bytes = 0
+        self.tx_bytes = 0  # Bytes from src_ip to dst_ip
+        self.rx_bytes = 0  # Bytes from dst_ip to src_ip
+        self.tx_packet_count = 0
+        self.rx_packet_count = 0
+        
+        self.rtt_list = []
+        self.syn_count = 0
+        self.fin_count = 0
+        self.rst_count = 0
+        
+        self.state = "ACTIVE"  # ACTIVE, CLOSED_FIN, CLOSED_RST, TIMED_OUT
+        self.packets = []
+        
+        self.update(first_packet)
+
+    def update(self, packet: dict):
+        pkt_time = packet.get("timestamp", time.time())
+        length = packet.get("length", 0)
+        p_src = packet.get("src_ip", "")
+        tcp_flags = packet.get("tcp_flags", "")
+        rtt = packet.get("rtt_ms", 0.0)
+
+        self.last_time = max(self.last_time, pkt_time)
+        self.duration_sec = round(max(0.01, self.last_time - self.start_time), 3)
+        self.packet_count += 1
+        self.total_bytes += length
+
+        if p_src == self.src_ip:
+            self.tx_bytes += length
+            self.tx_packet_count += 1
+        else:
+            self.rx_bytes += length
+            self.rx_packet_count += 1
+
+        if rtt > 0:
+            self.rtt_list.append(rtt)
+
+        if "S" in tcp_flags and "A" not in tcp_flags:
+            self.syn_count += 1
+        if "F" in tcp_flags:
+            self.fin_count += 1
+            self.state = "CLOSED_FIN"
+        if "R" in tcp_flags:
+            self.rst_count += 1
+            self.state = "CLOSED_RST"
+
+        if len(self.packets) < 50:  # Keep first 50 packet previews for Inspector timeline
+            self.packets.append(packet)
+
+    @property
+    def avg_rtt_ms(self) -> float:
+        return round(float(np.mean(self.rtt_list)), 2) if self.rtt_list else 0.0
+
+    @property
+    def max_rtt_ms(self) -> float:
+        return round(float(np.max(self.rtt_list)), 2) if self.rtt_list else 0.0
+
+    @property
+    def asymmetry_ratio(self) -> float:
+        """Upload/Download ratio: tx_bytes / (rx_bytes + 1)"""
+        return round(float(self.tx_bytes) / float(self.rx_bytes + 1.0), 2)
+
+    @property
+    def pps_avg(self) -> float:
+        return round(float(self.packet_count) / max(0.1, self.duration_sec), 1)
+
+    @property
+    def bps_avg(self) -> float:
+        return round(float(self.total_bytes) / max(0.1, self.duration_sec), 1)
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "key": f"{self.src_ip}:{self.src_port} ➔ {self.dst_ip}:{self.dst_port} ({self.protocol})",
+            "src_ip": self.src_ip,
+            "src_port": self.src_port,
+            "dst_ip": self.dst_ip,
+            "dst_port": self.dst_port,
+            "protocol": self.protocol,
+            "start_time_str": time.strftime('%H:%M:%S', time.localtime(self.start_time)),
+            "duration_sec": self.duration_sec,
+            "packet_count": self.packet_count,
+            "total_bytes": self.total_bytes,
+            "tx_bytes": self.tx_bytes,
+            "rx_bytes": self.rx_bytes,
+            "asymmetry_ratio": self.asymmetry_ratio,
+            "pps_avg": self.pps_avg,
+            "bps_avg": self.bps_avg,
+            "avg_rtt_ms": self.avg_rtt_ms,
+            "max_rtt_ms": self.max_rtt_ms,
+            "syn_count": self.syn_count,
+            "fin_count": self.fin_count,
+            "rst_count": self.rst_count,
+            "state": self.state,
+            "packet_samples_count": len(self.packets),
+            "packets": self.packets
+        }
+
+
+def extract_sessions_from_packets(packets: List[Dict], timeout_sec: float = 30.0) -> List[Dict]:
+    """
+    Group flat packet list into 5-Tuple Network Sessions (Flows).
+    """
+    sessions_map = {}
+    sessions_list = []
+    session_counter = 1
+
+    for pkt in packets:
+        s_ip = pkt.get("src_ip", "0.0.0.0")
+        s_port = pkt.get("src_port", 0)
+        d_ip = pkt.get("dst_ip", "0.0.0.0")
+        d_port = pkt.get("dst_port", 0)
+        proto = pkt.get("protocol", "OTHER")
+
+        # Canonical key: normalize flow direction so A->B and B->A share the same Session
+        if (s_ip, s_port) < (d_ip, d_port):
+            canonical_key = (s_ip, s_port, d_ip, d_port, proto)
+        else:
+            canonical_key = (d_ip, d_port, s_ip, s_port, proto)
+
+        if canonical_key not in sessions_map:
+            flow = SessionFlow(session_counter, canonical_key, pkt)
+            sessions_map[canonical_key] = flow
+            sessions_list.append(flow)
+            session_counter += 1
+        else:
+            flow = sessions_map[canonical_key]
+            # Check timeout
+            pkt_t = pkt.get("timestamp", time.time())
+            if pkt_t - flow.last_time > timeout_sec:
+                flow.state = "TIMED_OUT"
+                # Start new session flow
+                flow = SessionFlow(session_counter, canonical_key, pkt)
+                sessions_map[canonical_key] = flow
+                sessions_list.append(flow)
+                session_counter += 1
+            else:
+                flow.update(pkt)
+
+    return [s.to_dict() for s in sessions_list]
+
 
 def parse_pcap_range(filepath: str, start_idx: int = 1, end_idx: int = 2500) -> Tuple[List[Dict], int]:
     """
