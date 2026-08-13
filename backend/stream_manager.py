@@ -150,7 +150,7 @@ class StreamManager:
             else:
                 flow.update(packet)
 
-    def get_formatted_sessions((self) -> List[dict]:
+    def get_formatted_sessions(self) -> List[dict]:
         """
         Formated & ML-Predicted sessions list generated on demand (Lazy Evaluation).
         """
