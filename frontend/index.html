@@ -160,11 +160,13 @@
                 const msg = JSON.parse(event.data);
                 if (msg.type === 'INITIAL_STATE') {
                   if (msg.stats) setStats(msg.stats);
+                  if (msg.sessions) setSessionsList(msg.sessions);
                   if (typeof msg.is_playing === 'boolean') setIsPlaying(msg.is_playing);
                   if (msg.speed) setSpeed(msg.speed);
                 } else if (msg.type === 'PACKET_EVENT') {
                   const pkt = msg.packet;
                   if (msg.stats) setStats(msg.stats);
+                  if (msg.sessions) setSessionsList(msg.sessions);
                   if (typeof msg.is_playing === 'boolean') setIsPlaying(msg.is_playing);
 
                   if (pkt && pkt.id) {

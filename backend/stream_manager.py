@@ -4,18 +4,17 @@ import random
 import time
 import os
 import numpy as np
-from typing import List, Set
+from typing import List, Set, Dict
 from fastapi import WebSocket
 from ml_engine import PacketAnomalyDetector, SessionAnomalyDetector
-from pcap_parser import generate_benign_packet, generate_anomaly_packet, extract_sessions_from_packets
-from server_analyzer import generate_server_analysis_report
+from pcap_parser import generate_benign_packet, generate_anomaly_packet, extract_sessions_from_packets, SessionFlow
 
 class StreamManager:
     """
     StreamManager initialized with clean idle state:
     - Starts with 0 packets and clean '분석 PCAP 업로드 대기 중' source indicator.
-    - Resets source filename and model on reset_all_data().
-    - Sets current_filename and saved_model_filename ONLY when analysis actually starts.
+    - Resets source filename, model, and session flow tracking on reset_all_data().
+    - Real-time live session updates as packets stream in.
     """
     def __init__(self):
         self.active_websockets: Set[WebSocket] = set()
@@ -26,6 +25,7 @@ class StreamManager:
         
         self.pcap_queue: List[dict] = []
         self.analyzed_history: List[dict] = []
+        self.live_sessions_map: Dict[tuple, SessionFlow] = {}
         self.sessions_history: List[dict] = []
         self.session_anomalies_count: int = 0
         
@@ -51,7 +51,7 @@ class StreamManager:
         self.protocol_counts = {"TCP": 0, "UDP": 0, "HTTPS": 0, "DNS": 0, "OTHER": 0}
 
     def reset_all_data(self):
-        """Clear all packet & session statistics, history, currently inspecting source filename, and model name."""
+        """Clear all packet & session statistics, live session tracking maps, history, and model state."""
         self.total_packets = 0
         self.anomalies_01_count = 0
         self.max_score = 0.0
@@ -59,8 +59,12 @@ class StreamManager:
         self.protocol_counts = {"TCP": 0, "UDP": 0, "HTTPS": 0, "DNS": 0, "OTHER": 0}
         self.detector.history_scores.clear()
         self.analyzed_history.clear()
+        
+        # Reset Session Flow tracking completely
+        self.live_sessions_map.clear()
         self.sessions_history.clear()
         self.session_anomalies_count = 0
+        
         self.pcap_queue.clear()
         self.is_playing = False
         self.is_pcap_session = False
@@ -70,7 +74,7 @@ class StreamManager:
         self.saved_model_filename = "선택 안됨"
         self.analysis_target_count = 0
         self.total_packets_in_file = 0
-        print("[StreamManager] All statistics, session history, and inspecting source filename cleanly reset.")
+        print("[StreamManager] All packet & 5-Tuple session statistics cleanly reset.")
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -78,6 +82,7 @@ class StreamManager:
         await websocket.send_text(json.dumps({
             "type": "INITIAL_STATE",
             "stats": self.get_stats(),
+            "sessions": self.sessions_history,
             "is_playing": self.is_playing,
             "speed": self.speed,
             "threshold": self.detector.score_threshold
@@ -115,9 +120,57 @@ class StreamManager:
         self.detector.score_threshold = round(new_thresh, 4)
         print(f"[StreamManager Calibrate] Dynamic 99.9% threshold set to: {self.detector.score_threshold:.4f} across {len(packets)} packets.")
 
+    def update_live_session(self, packet: dict):
+        """
+        Dynamically update 5-Tuple Session Flow in real-time as each streaming packet arrives.
+        """
+        s_ip = packet.get("src_ip", "0.0.0.0")
+        s_port = packet.get("src_port", 0)
+        d_ip = packet.get("dst_ip", "0.0.0.0")
+        d_port = packet.get("dst_port", 0)
+        proto = packet.get("protocol", "OTHER")
+
+        # Canonical key: normalize flow direction so A->B and B->A share the same Session
+        if (s_ip, s_port) < (d_ip, d_port):
+            canonical_key = (s_ip, s_port, d_ip, d_port, proto)
+        else:
+            canonical_key = (d_ip, d_port, s_ip, s_port, proto)
+
+        if canonical_key not in self.live_sessions_map:
+            session_id = len(self.live_sessions_map) + 1
+            flow = SessionFlow(session_id, canonical_key, packet)
+            self.live_sessions_map[canonical_key] = flow
+        else:
+            flow = self.live_sessions_map[canonical_key]
+            pkt_t = packet.get("timestamp", time.time())
+            if pkt_t - flow.last_time > 30.0:
+                flow.state = "TIMED_OUT"
+                session_id = len(self.live_sessions_map) + 1
+                flow = SessionFlow(session_id, canonical_key, packet)
+                self.live_sessions_map[canonical_key] = flow
+            else:
+                flow.update(packet)
+
+        # Predict session score using Session ML Detector
+        s_dict = flow.to_dict()
+        res = self.session_detector.predict_one(s_dict)
+        s_dict["score"] = res["score"]
+        s_dict["is_anomaly_01"] = res["is_anomaly_01"]
+        s_dict["threshold"] = res["threshold"]
+        s_dict["explanation"] = res["explanation"]
+
+        # Sync to sessions_history list
+        existing_idx = next((i for i, s in enumerate(self.sessions_history) if s["session_id"] == flow.session_id), -1)
+        if existing_idx >= 0:
+            self.sessions_history[existing_idx] = s_dict
+        else:
+            self.sessions_history.append(s_dict)
+
+        self.session_anomalies_count = len([s for s in self.sessions_history if s.get("is_anomaly_01")])
+
     def load_pcap_range(self, packets: List[dict], total_in_file: int, filename: str):
         """
-        Load packets from PCAP file for inspection and extract 5-Tuple Network Sessions.
+        Load packets from PCAP file for inspection and reset/initialize 5-Tuple Network Sessions.
         """
         self.reset_all_data()
 
@@ -131,22 +184,12 @@ class StreamManager:
         if self.detector.is_fitted and packets:
             self.calibrate_session_threshold(packets)
 
-        # Extract & Analyze 5-Tuple Network Sessions
+        # Pre-fit Session Anomaly Detector using initial PCAP batch
         sessions = extract_sessions_from_packets(packets)
         if sessions:
             self.session_detector.fit(sessions)
-            for s in sessions:
-                res = self.session_detector.predict_one(s)
-                s["score"] = res["score"]
-                s["is_anomaly_01"] = res["is_anomaly_01"]
-                s["threshold"] = res["threshold"]
-                s["explanation"] = res["explanation"]
 
-            self.sessions_history = sessions
-            self.session_anomalies_count = len([s for s in sessions if s.get("is_anomaly_01")])
-            print(f"[StreamManager Sessions] Extracted & Analyzed {len(sessions)} sessions ({self.session_anomalies_count} session anomalies)")
-
-        print(f"[StreamManager] Loaded {len(packets)} packets from '{filename}' for inspection. Model: {self.saved_model_filename}")
+        print(f"[StreamManager] Reset & Loaded {len(packets)} packets from '{filename}' for inspection & live session tracking.")
 
     async def broadcast_packet(self, packet: dict):
         self.total_packets += 1
@@ -176,10 +219,14 @@ class StreamManager:
 
         self.analyzed_history.append(packet)
 
+        # Real-Time Session Update
+        self.update_live_session(packet)
+
         msg = json.dumps({
             "type": "PACKET_EVENT",
             "packet": packet,
             "stats": self.get_stats(),
+            "sessions": self.sessions_history,
             "is_playing": self.is_playing
         })
 
