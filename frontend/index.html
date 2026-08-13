@@ -104,7 +104,7 @@
       const [isPlaying, setIsPlaying] = useState(false);
       const [speed, setSpeed] = useState(1.0);
       const [selectedPacket, setSelectedPacket] = useState(null);
-      const [activeTab, setActiveTab] = useState('anomaly');
+      const [activeTab, setActiveTab] = useState('live');
 
       // Help Modal State (guide, specs, tech)
       const [showHelpModal, setShowHelpModal] = useState(false);
@@ -169,7 +169,7 @@
                   if (msg.sessions) setSessionsList(msg.sessions);
                   if (typeof msg.is_playing === 'boolean') setIsPlaying(msg.is_playing);
 
-                  if (pkt && pkt.id) {
+                  if (pkt && pkt.id !== undefined) {
                     setPackets((prev) => [pkt, ...prev].slice(0, 100));
                     if (pkt.is_anomaly_01) {
                       setAnomalyPackets((prev) => [pkt, ...prev].slice(0, 50));
