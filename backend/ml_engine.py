@@ -82,19 +82,21 @@ class PacketAnomalyDetector:
         syn_flags = [float(p.get("tcp_syn_flag", 0.0)) for p in packets]
         rtts = [float(p.get("rtt_ms", 0.0)) for p in packets]
 
+        is_approved_list = [1.0 if (p.get("src_ip", "") in self.approved_encrypted_ips or p.get("dst_ip", "") in self.approved_encrypted_ips) else 0.0 for p in packets]
+
         self.last_feature_stats = {
             "train_packet_count": len(packets),
             "score_threshold": round(float(self.score_threshold), 4),
             "features": {
                 "length": {
-                    "name": "Length (패킷 크기)",
+                    "name": "Length (패킷 전체 크기)",
                     "unit": "Bytes",
                     "mean": round(float(np.mean(lengths)), 1),
                     "max": round(float(np.max(lengths)), 1),
                     "p999_threshold": round(float(np.percentile(lengths, 99.9)), 1)
                 },
                 "payload_len": {
-                    "name": "Payload Length (페이로드 크기)",
+                    "name": "Payload Length (순수 페이로드 크기)",
                     "unit": "Bytes",
                     "mean": round(float(np.mean(payload_lens)), 1),
                     "max": round(float(np.max(payload_lens)), 1),
@@ -149,6 +151,13 @@ class PacketAnomalyDetector:
                     "mean": round(float(np.mean(rtts)), 2),
                     "max": round(float(np.max(rtts)), 2),
                     "p999_threshold": round(float(np.percentile(rtts, 99.9)), 2)
+                },
+                "is_approved": {
+                    "name": "Approved Server Flag (피드백 승인 서버 프로필)",
+                    "unit": "Flag (0~1)",
+                    "mean": round(float(np.mean(is_approved_list)), 3),
+                    "max": 1.0,
+                    "p999_threshold": 1.0
                 }
             }
         }
@@ -271,8 +280,18 @@ class PacketAnomalyDetector:
                         "size_velocity_ratio": {"name": "Size Velocity Ratio (크기대비 속도 비율)", "unit": "Ratio", "mean": 95.8, "max": 15140.0, "p999_threshold": 3028.0},
                         "pps_variance": {"name": "PPS Variance (초당 패킷 변동성/분산)", "unit": "Variance", "mean": 12.4, "max": 250.0, "p999_threshold": 100.0},
                         "tcp_syn_flag": {"name": "TCP SYN Flag (SYN 연결요청 비율)", "unit": "Flag", "mean": 0.05, "max": 1.0, "p999_threshold": 1.0},
-                        "rtt_ms": {"name": "RTT Response Time (응답시간 지연)", "unit": "ms", "mean": 8.4, "max": 450.0, "p999_threshold": 200.0}
+                        "rtt_ms": {"name": "RTT Response Time (응답시간 지연)", "unit": "ms", "mean": 8.4, "max": 450.0, "p999_threshold": 200.0},
+                        "is_approved": {"name": "Approved Server Flag (피드백 승인 서버 프로필)", "unit": "Flag (0~1)", "mean": 0.0, "max": 1.0, "p999_threshold": 1.0}
                     }
+                }
+
+            if "features" in feature_stats and "is_approved" not in feature_stats["features"]:
+                feature_stats["features"]["is_approved"] = {
+                    "name": "Approved Server Flag (피드백 승인 서버 프로필)",
+                    "unit": "Flag (0~1)",
+                    "mean": 0.0,
+                    "max": 1.0,
+                    "p999_threshold": 1.0
                 }
 
             return {
